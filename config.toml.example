@@ -1,0 +1,10 @@
+[general]
+bind_addr = "[::]"
+bind_port = 3000
+
+[database]
+host = "192.0.2.1"
+port = 3306
+user = "username"
+password = "password"
+database = "kea database name"
