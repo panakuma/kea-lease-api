@@ -6,7 +6,7 @@
 use anyhow::Context;
 use serde::Deserialize;
 use sqlx::mysql::MySqlConnectOptions;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// 設定ファイルのパスを差し替える環境変数。
 const ENV_CONFIG: &str = "KEA_LEASE_API_CONFIG";
@@ -14,6 +14,7 @@ const ENV_CONFIG: &str = "KEA_LEASE_API_CONFIG";
 const ENV_DB_PASSWORD: &str = "KEA_LEASE_API_DB_PASSWORD";
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
@@ -30,7 +31,8 @@ pub struct GeneralConfig {
     /// 1 リクエストあたりの上限時間 (秒)。超えると 408 を返す。
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
-    /// `limit` クエリパラメータの上限。1 回の応答で返す行数のハードキャップ。
+    /// `limit` クエリパラメータの上限。これより大きい `limit` は切り詰める。
+    /// `limit` を指定しない問い合わせには LIMIT を付けない (v0.1 と同じ全件)。
     #[serde(default = "default_max_limit")]
     pub max_limit: u32,
     /// リバースプロキシ配下で X-Forwarded-For をクライアント IP として
@@ -95,7 +97,10 @@ impl Config {
     /// 優先順位は 第1引数 > `KEA_LEASE_API_CONFIG` > カレントディレクトリの
     /// `config.toml`。systemd から起動する場合に WorkingDirectory へ依存しなくて
     /// 済むよう、明示指定できるようにしてある。
-    pub fn load() -> anyhow::Result<Self> {
+    ///
+    /// 実際に読んだパスも一緒に返す。ログ用に別途 `resolve_path()` を呼び直すと、
+    /// 読んだファイルと表示するパスがずれうる。
+    pub fn load() -> anyhow::Result<(Self, PathBuf)> {
         let path = Self::resolve_path();
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("設定ファイルを読めませんでした: {}", path.display()))?;
@@ -106,7 +111,7 @@ impl Config {
             config.database.password = password;
         }
         config.validate()?;
-        Ok(config)
+        Ok((config, path))
     }
 
     fn resolve_path() -> PathBuf {
@@ -168,9 +173,4 @@ impl DatabaseConfig {
             self.user, self.host, self.port, self.database
         )
     }
-}
-
-/// 実際に読み込んだ設定ファイルのパス (ログ表示用)。
-pub fn config_path_hint() -> impl AsRef<Path> {
-    Config::resolve_path()
 }

@@ -11,7 +11,32 @@ use crate::capability::{Bind, Family, LeaseCapability};
 use crate::error::{ApiError, ApiResult};
 use crate::lease::HwaddrFormat;
 use crate::schema::Schema;
+use axum::extract::{FromRequestParts, Query};
+use axum::http::request::Parts;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+
+/// `Query<T>` の薄い包み。
+///
+/// axum 既定の拒否応答は text/plain なので、`?limit=abc` や綴り間違いだけ
+/// エラーの形式が変わってしまう。ここで `ApiError` に載せ替えて、
+/// パラメータ不正はすべて同じ JSON で返す。
+pub struct ValidatedQuery<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ValidatedQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(ValidatedQuery(value)),
+            Err(rejection) => Err(ApiError::bad_request(rejection.body_text())),
+        }
+    }
+}
 
 /// `/leases` `/leases6` `/leases/count` が受け取るクエリパラメータ。
 ///
@@ -94,6 +119,7 @@ impl Plan {
         }
 
         // --- 単純な等値条件 ------------------------------------------------
+        // subnet_id はどの Kea スキーマにもある列なので存在確認しない。
         if let Some(subnet_id) = query.subnet_id {
             conditions.push(format!("{table}.subnet_id = ?"));
             binds.push(Bind::U32(subnet_id));
@@ -106,6 +132,7 @@ impl Plan {
 
         // --- バイナリ列の前方一致 ------------------------------------------
         if let Some(hwaddr) = query.hwaddr.as_deref() {
+            capability.require_column("hwaddr")?;
             let prefix = normalize_hex(hwaddr, "hwaddr")?;
             conditions.push(format!("HEX({table}.hwaddr) LIKE CONCAT(?, '%')"));
             binds.push(Bind::Str(prefix));
@@ -116,6 +143,7 @@ impl Plan {
                     "duid は IPv6 のリース (/leases6) でのみ指定できます",
                 ));
             }
+            capability.require_column("duid")?;
             let prefix = normalize_hex(duid, "duid")?;
             conditions.push(format!("HEX({table}.duid) LIKE CONCAT(?, '%')"));
             binds.push(Bind::Str(prefix));
@@ -123,6 +151,7 @@ impl Plan {
 
         // --- ホスト名の部分一致 --------------------------------------------
         if let Some(hostname) = query.hostname.as_deref() {
+            capability.require_column("hostname")?;
             conditions.push(format!(
                 "{table}.hostname LIKE CONCAT('%', ?, '%') ESCAPE '\\\\'"
             ));
@@ -167,14 +196,7 @@ impl Plan {
             (limit, _) => limit,
         };
 
-        let hwaddr_format = match query.hwaddr_format.as_deref() {
-            None => HwaddrFormat::default(),
-            Some(value) => HwaddrFormat::parse(value).ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "hwaddr_format に指定できるのは hex か colon です (指定値: {value})"
-                ))
-            })?,
-        };
+        let hwaddr_format = HwaddrFormat::from_param(query.hwaddr_format.as_deref())?;
 
         let where_sql = if conditions.is_empty() {
             String::new()

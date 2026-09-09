@@ -6,18 +6,18 @@
 use crate::capability::{Family, LeaseCapability, arguments};
 use crate::error::{ApiError, ApiResult};
 use crate::lease::{HwaddrFormat, Lease4, Lease6};
-use crate::query::{LeaseQuery, Plan};
+use crate::query::{LeaseQuery, Plan, ValidatedQuery};
 use crate::state::AppState;
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
 };
 use sqlx::mysql::MySqlRow;
 
 /// `GET /` `GET /leases`
 pub async fn list_leases4(
     State(state): State<AppState>,
-    Query(query): Query<LeaseQuery>,
+    ValidatedQuery(query): ValidatedQuery<LeaseQuery>,
 ) -> ApiResult<Json<Vec<Lease4>>> {
     let capability = state.capability(Family::V4)?;
     let plan = Plan::build(&query, capability, state.max_limit)?;
@@ -35,7 +35,7 @@ pub async fn list_leases4(
 /// v0.1 と同じく裸の数値を返す。
 pub async fn count_leases4(
     State(state): State<AppState>,
-    Query(query): Query<LeaseQuery>,
+    ValidatedQuery(query): ValidatedQuery<LeaseQuery>,
 ) -> ApiResult<Json<i64>> {
     let capability = state.capability(Family::V4)?;
     let plan = Plan::build(&query, capability, state.max_limit)?;
@@ -48,10 +48,10 @@ pub async fn count_leases4(
 pub async fn get_lease4(
     State(state): State<AppState>,
     Path(address): Path<String>,
-    Query(query): Query<AddressQuery>,
+    ValidatedQuery(query): ValidatedQuery<AddressQuery>,
 ) -> ApiResult<Json<Lease4>> {
     let capability = state.capability(Family::V4)?;
-    let hwaddr_format = query.hwaddr_format()?;
+    let hwaddr_format = HwaddrFormat::from_param(query.hwaddr_format.as_deref())?;
     let row = fetch_one(&state, capability, &address).await?;
     Ok(Json(Lease4::from_row(&row, capability, hwaddr_format)))
 }
@@ -59,7 +59,7 @@ pub async fn get_lease4(
 /// `GET /leases6`
 pub async fn list_leases6(
     State(state): State<AppState>,
-    Query(query): Query<LeaseQuery>,
+    ValidatedQuery(query): ValidatedQuery<LeaseQuery>,
 ) -> ApiResult<Json<Vec<Lease6>>> {
     let capability = state.capability(Family::V6)?;
     let plan = Plan::build(&query, capability, state.max_limit)?;
@@ -75,7 +75,7 @@ pub async fn list_leases6(
 /// `GET /leases6/count`
 pub async fn count_leases6(
     State(state): State<AppState>,
-    Query(query): Query<LeaseQuery>,
+    ValidatedQuery(query): ValidatedQuery<LeaseQuery>,
 ) -> ApiResult<Json<i64>> {
     let capability = state.capability(Family::V6)?;
     let plan = Plan::build(&query, capability, state.max_limit)?;
@@ -86,10 +86,10 @@ pub async fn count_leases6(
 pub async fn get_lease6(
     State(state): State<AppState>,
     Path(address): Path<String>,
-    Query(query): Query<AddressQuery>,
+    ValidatedQuery(query): ValidatedQuery<AddressQuery>,
 ) -> ApiResult<Json<Lease6>> {
     let capability = state.capability(Family::V6)?;
-    let hwaddr_format = query.hwaddr_format()?;
+    let hwaddr_format = HwaddrFormat::from_param(query.hwaddr_format.as_deref())?;
     let row = fetch_one(&state, capability, &address).await?;
     Ok(Json(Lease6::from_row(&row, capability, hwaddr_format)))
 }
@@ -137,17 +137,4 @@ async fn fetch_one(
 #[serde(deny_unknown_fields)]
 pub struct AddressQuery {
     pub hwaddr_format: Option<String>,
-}
-
-impl AddressQuery {
-    fn hwaddr_format(&self) -> ApiResult<HwaddrFormat> {
-        match self.hwaddr_format.as_deref() {
-            None => Ok(HwaddrFormat::default()),
-            Some(value) => HwaddrFormat::parse(value).ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "hwaddr_format に指定できるのは hex か colon です (指定値: {value})"
-                ))
-            }),
-        }
-    }
 }

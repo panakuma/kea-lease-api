@@ -12,8 +12,10 @@
 //! 判定は起動時の 1 回で済むので、SELECT リストも先に組み立てておく。
 //!
 //! SELECT リストは Kea 1.0 からある列も含めて、全列を存在確認してから組み立てる。
-//! information_schema が制限されていて列が見えない環境では、該当項目が null に
-//! なる代わりに、存在しない列を SELECT して落ちることはなくなる。
+//! information_schema で一部の列しか見えない環境では、該当項目が null になる
+//! 代わりに、存在しない列を SELECT して落ちることはなくなる。
+//! (テーブルの列が 1 つも見えない場合は「テーブルが無い」と判断して 404 を返す。
+//!  `Schema::has_lease4` / `has_lease6` を参照。)
 
 use crate::error::{ApiError, ApiResult};
 use crate::schema::Schema;
@@ -243,9 +245,13 @@ impl LeaseCapability {
             }
         }
 
-        let mut order_columns = vec!["address", "expire", "hostname", "subnet_id"];
-        if columns.contains("state") {
-            order_columns.push("state");
+        // address は常にあるので無条件。残りは接続先スキーマに列がある場合だけ
+        // 候補に出す。無い列を ORDER BY に書くとクエリごと落ちる。
+        let mut order_columns = vec!["address"];
+        for candidate in ["expire", "hostname", "subnet_id", "state"] {
+            if columns.contains(candidate) {
+                order_columns.push(candidate);
+            }
         }
 
         Self {
@@ -394,9 +400,10 @@ mod tests {
              lease4.valid_lifetime, lease4.expire, lease4.subnet_id"
         );
         assert!(!capability.has("state"));
+        // hostname 列が無いスキーマなので、order_by の候補にも出さない。
         assert_eq!(
             capability.order_columns(),
-            ["address", "expire", "hostname", "subnet_id"]
+            ["address", "expire", "subnet_id"]
         );
     }
 
@@ -406,6 +413,37 @@ mod tests {
         assert!(capability.has("state"));
         assert!(capability.order_columns().contains(&"state"));
         assert!(capability.require_column("state").is_ok());
+    }
+
+    /// lease6 も同じ判定を通る。hostname 列が無ければ order_by の候補に出さない。
+    #[test]
+    fn lease6_order_columns_follow_the_schema_too() {
+        let old = capability(
+            Family::V6,
+            &[],
+            &[
+                ("address", "varchar"),
+                ("duid", "varbinary"),
+                ("expire", "timestamp"),
+            ],
+        );
+        assert_eq!(old.order_columns(), ["address", "expire"]);
+
+        let modern = capability(
+            Family::V6,
+            &[],
+            &[
+                ("address", "binary"),
+                ("expire", "timestamp"),
+                ("hostname", "varchar"),
+                ("subnet_id", "int"),
+                ("state", "int"),
+            ],
+        );
+        assert_eq!(
+            modern.order_columns(),
+            ["address", "expire", "hostname", "subnet_id", "state"]
+        );
     }
 
     #[test]

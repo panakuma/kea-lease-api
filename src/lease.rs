@@ -4,6 +4,7 @@
 //! 「あれば読む、無ければ null」で組み立てる。
 
 use crate::capability::{LeaseCapability, optional};
+use crate::error::{ApiError, ApiResult};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 use sqlx::mysql::MySqlRow;
@@ -19,11 +20,24 @@ pub enum HwaddrFormat {
 }
 
 impl HwaddrFormat {
-    pub fn parse(value: &str) -> Option<Self> {
+    fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "hex" => Some(HwaddrFormat::Hex),
             "colon" | "mac" => Some(HwaddrFormat::Colon),
             _ => None,
+        }
+    }
+
+    /// `hwaddr_format` クエリパラメータの解釈。一覧系と 1 件取得系で
+    /// 同じ判定・同じ文言を使うため、ここに 1 つだけ置く。
+    pub fn from_param(value: Option<&str>) -> ApiResult<Self> {
+        match value {
+            None => Ok(HwaddrFormat::default()),
+            Some(value) => HwaddrFormat::parse(value).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "hwaddr_format に指定できるのは hex か colon です (指定値: {value})"
+                ))
+            }),
         }
     }
 
@@ -32,14 +46,19 @@ impl HwaddrFormat {
         let hex = hex?;
         match self {
             HwaddrFormat::Hex => Some(hex),
-            HwaddrFormat::Colon => Some(
-                hex.to_ascii_lowercase()
-                    .as_bytes()
-                    .chunks(2)
-                    .map(|pair| String::from_utf8_lossy(pair).into_owned())
-                    .collect::<Vec<_>>()
-                    .join(":"),
-            ),
+            // HEX() の出力は ASCII なので、1 本の String に直接書き出す。
+            HwaddrFormat::Colon => {
+                let mut formatted = String::with_capacity(hex.len() + hex.len() / 2);
+                for (index, pair) in hex.as_bytes().chunks(2).enumerate() {
+                    if index > 0 {
+                        formatted.push(':');
+                    }
+                    for byte in pair {
+                        formatted.push(byte.to_ascii_lowercase() as char);
+                    }
+                }
+                Some(formatted)
+            }
         }
     }
 }
@@ -198,6 +217,28 @@ mod tests {
     fn colon_format_splits_every_octet() {
         let formatted = HwaddrFormat::Colon.apply(Some("00005E005300".to_string()));
         assert_eq!(formatted.as_deref(), Some("00:00:5e:00:53:00"));
+    }
+
+    #[test]
+    fn colon_format_handles_short_and_empty_values() {
+        assert_eq!(
+            HwaddrFormat::Colon.apply(Some("AB".to_string())).as_deref(),
+            Some("ab")
+        );
+        assert_eq!(
+            HwaddrFormat::Colon.apply(Some(String::new())).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn unknown_hwaddr_format_is_rejected() {
+        assert!(HwaddrFormat::from_param(None).is_ok());
+        assert_eq!(
+            HwaddrFormat::from_param(Some("colon")).unwrap(),
+            HwaddrFormat::Colon
+        );
+        assert!(HwaddrFormat::from_param(Some("dashes")).is_err());
     }
 
     #[test]

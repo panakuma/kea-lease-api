@@ -42,9 +42,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config_path = config::config_path_hint();
-    let config = Config::load()?;
-    tracing::info!("設定ファイル: {}", config_path.as_ref().display());
+    let (config, config_path) = Config::load()?;
+    tracing::info!("設定ファイル: {}", config_path.display());
 
     let pool = MySqlPoolOptions::new()
         .max_connections(config.database.max_connections)
@@ -66,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let lease4 = Arc::new(LeaseCapability::detect(Family::V4, schema.clone()));
     let lease6 = Arc::new(LeaseCapability::detect(Family::V6, schema.clone()));
-    log_capabilities(&pool, &lease4, &lease6).await;
+    log_capabilities(&schema, &lease4, &lease6);
 
     let app_state = AppState {
         pool,
@@ -118,12 +117,8 @@ async fn main() -> anyhow::Result<()> {
 
 /// 起動時に、接続先スキーマから見えた情報を出しておく。
 /// 「新しい項目が全部 null で返る」ときの切り分けが楽になる。
-async fn log_capabilities(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    lease4: &LeaseCapability,
-    lease6: &LeaseCapability,
-) {
-    match schema::schema_version(pool).await {
+fn log_capabilities(schema: &Schema, lease4: &LeaseCapability, lease6: &LeaseCapability) {
+    match schema.version() {
         Some(version) => tracing::info!("Kea スキーマバージョン: {version}"),
         None => tracing::warn!("schema_version テーブルを読めませんでした"),
     }

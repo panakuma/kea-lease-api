@@ -149,7 +149,7 @@ async fn family_stats(app: &AppState, family: Family) -> ApiResult<Option<Family
 /// `GET /stats`
 pub async fn stats(State(app): State<AppState>) -> ApiResult<Json<StatsResponse>> {
     Ok(Json(StatsResponse {
-        schema_version: crate::schema::schema_version(&app.pool).await,
+        schema_version: app.schema.version().map(str::to_string),
         lease4: family_stats(&app, Family::V4).await?,
         lease6: family_stats(&app, Family::V6).await?,
     }))
@@ -241,7 +241,7 @@ pub async fn healthz(State(app): State<AppState>) -> Response {
             Json(HealthResponse {
                 status: "ok",
                 database: "ok",
-                schema_version: crate::schema::schema_version(&app.pool).await,
+                schema_version: app.schema.version().map(str::to_string),
             }),
         )
             .into_response(),

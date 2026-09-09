@@ -25,6 +25,8 @@ pub struct Schema {
     pub lease6_types: BTreeMap<i8, String>,
     /// lease6.hwaddr_source 値 -> 名前。
     pub hwaddr_sources: BTreeMap<u32, String>,
+    /// Kea のスキーマバージョン。起動時に 1 度読んで持ち回る。
+    version: Option<String>,
 }
 
 impl Schema {
@@ -46,7 +48,9 @@ impl Schema {
         for row in rows {
             let table: String = row.try_get("table_name")?;
             let column: String = row.try_get("column_name")?;
-            let data_type: String = row.try_get("data_type").unwrap_or_default();
+            // DATA_TYPE を読み損ねると lease6.address をテキスト列と誤認し、
+            // IPv6 のアドレスが全件 null になる。黙って続けず起動時に落とす。
+            let data_type: String = row.try_get("data_type")?;
             match table.as_str() {
                 "lease4" => {
                     lease4_columns.insert(column, data_type.to_ascii_lowercase());
@@ -64,7 +68,16 @@ impl Schema {
             lease_states: load_lease_states(pool).await,
             lease6_types: load_lease6_types(pool).await,
             hwaddr_sources: load_hwaddr_sources(pool).await,
+            version: load_schema_version(pool).await,
         })
+    }
+
+    /// Kea のスキーマバージョン (schema_version テーブル)。
+    ///
+    /// 稼働中に変わるものではないので起動時の値をそのまま返す。
+    /// 応答のたびに問い合わせると /metrics や /healthz が 1 往復増える。
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
     }
 
     pub fn has_lease4(&self) -> bool {
@@ -135,7 +148,7 @@ impl Schema {
         fn columns(entries: &[(&str, &str)]) -> HashMap<String, String> {
             entries
                 .iter()
-                .map(|(name, data_type)| (name.to_string(), data_type.to_string()))
+                .map(|(name, data_type)| (name.to_string(), data_type.to_ascii_lowercase()))
                 .collect()
         }
         Self {
@@ -147,6 +160,7 @@ impl Schema {
                 .collect(),
             lease6_types: BTreeMap::new(),
             hwaddr_sources: BTreeMap::new(),
+            version: None,
         }
     }
 }
@@ -233,8 +247,8 @@ async fn load_hwaddr_sources(pool: &Pool<MySql>) -> BTreeMap<u32, String> {
     }
 }
 
-/// Kea のスキーマバージョン (schema_version テーブル)。
-pub async fn schema_version(pool: &Pool<MySql>) -> Option<String> {
+/// schema_version テーブルの読み出し。読めなければ None (致命的ではない)。
+async fn load_schema_version(pool: &Pool<MySql>) -> Option<String> {
     let row = sqlx::query("SELECT version, minor FROM schema_version")
         .fetch_one(pool)
         .await

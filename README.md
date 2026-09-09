@@ -24,7 +24,7 @@ cargo build --release
 bind_addr = "[::]"
 bind_port = 3000
 # request_timeout_secs = 30   # 1リクエストの上限時間。超えると408を返します
-# max_limit = 10000           # limitパラメータの上限 = 1回に返す最大行数
+# max_limit = 10000           # limitパラメータの上限 (limit未指定なら全件)
 # trust_proxy_header = false  # trueにするとX-Forwarded-ForをログのクライアントIPに使います
 
 [database]
@@ -94,14 +94,14 @@ curl '192.0.2.1:3000/leases/count?state=all&include_expired=true' # テーブル
 | `hwaddr` | - | MACアドレスの前方一致。`00:00:5e` `00-00-5e` `00005e` のどれでも可 |
 | `duid` | - | DUIDの前方一致 (`/leases6`のみ) |
 | `hostname` | - | ホスト名の部分一致 |
-| `limit` / `offset` | - | ページング。`limit`は`max_limit`で頭打ちになります |
-| `order_by` | `address` | `address` / `expire` / `hostname` / `subnet_id` / `state` |
+| `limit` / `offset` | - | ページング。`limit`は`max_limit`で頭打ちになります。`limit`を指定しない場合はLIMITを付けないので、条件に合う全行が返ります |
+| `order_by` | `address` | `address` / `expire` / `hostname` / `subnet_id` / `state`。接続先のスキーマに無い列は選べません (400を返し、選べる列名を並べます) |
 | `desc` | `false` | `true`で降順 |
 | `hwaddr_format` | `hex` | `hex`は`00005E005300`、`colon`は`00:00:5e:00:53:00` |
 
 知らないパラメータを渡すと400を返します。`subnetid=1`のような綴り間違いが「絞ったつもりで全件」になるのを防ぐためです。
 
-`/leases/count` と `/leases6/count` では `limit` / `offset` / `order_by` / `desc` は意味を持たないため無視されます (件数を数えるだけなので)。
+`/leases/count` と `/leases6/count` では `limit` / `offset` / `order_by` / `desc` は件数に影響しません (件数を数えるだけなので)。ただし値の妥当性は一覧系と同じように検査するため、`order_by=bogus` や `limit=0` は400になります。
 また `expire` が `NULL` のリース (Keaスキーマ24以降でありえます) は期限切れ扱いになり、`include_expired=true` を付けたときだけ出てきます。
 
 ```sh
@@ -155,6 +155,7 @@ curl 192.0.2.1:3000/leases | jq
 - `pool_id` … Keaスキーマ18以降
 
 接続先のKeaが古くて列が無い場合、その項目は `null` になります。起動時のログにどの列が無かったかを出します。
+無い列を `hostname=` や `pool_id=` のような絞り込み・`order_by` に指定した場合は、500ではなく400で「その列がありません」と返します。
 
 `expire` は常にUTCです。KeaはDHCPサーバのローカル時刻で書き込みますが、MySQLの`TIMESTAMP`型は内部的にUTCで保持されるため、DBサーバのタイムゾーン設定にかかわらず正しい時刻が返ります。
 

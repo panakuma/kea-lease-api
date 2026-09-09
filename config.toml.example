@@ -3,7 +3,8 @@ bind_addr = "[::]"
 bind_port = 3000
 # 1 リクエストの上限時間 (秒)。超えると 408 を返す。
 # request_timeout_secs = 30
-# limit クエリパラメータの上限。1 回の応答で返す最大行数。
+# limit クエリパラメータの上限。これより大きい limit は切り詰める。
+# limit を指定しない問い合わせには LIMIT を付けない (条件に合う全行を返す)。
 # max_limit = 10000
 # リバースプロキシ配下で X-Forwarded-For をクライアント IP として
 # ログに出す場合のみ true にする。
