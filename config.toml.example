@@ -1,10 +1,20 @@
 [general]
 bind_addr = "[::]"
 bind_port = 3000
+# 1 リクエストの上限時間 (秒)。超えると 408 を返す。
+# request_timeout_secs = 30
+# limit クエリパラメータの上限。1 回の応答で返す最大行数。
+# max_limit = 10000
+# リバースプロキシ配下で X-Forwarded-For をクライアント IP として
+# ログに出す場合のみ true にする。
+# trust_proxy_header = false
 
 [database]
 host = "192.0.2.1"
 port = 3306
 user = "username"
+# 環境変数 KEA_LEASE_API_DB_PASSWORD を設定するとそちらが優先される。
 password = "password"
 database = "kea database name"
+# max_connections = 5
+# connect_timeout_secs = 10

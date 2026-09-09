@@ -1,200 +1,243 @@
+//! ISC Kea の MySQL / MariaDB バックエンドからリース情報を読み出して
+//! JSON で返す HTTP API サーバ。
+
+mod config;
+mod error;
+mod handlers;
+mod lease;
+mod query;
+mod schema;
+mod state;
+mod stats;
+
 use anyhow::Context;
 use axum::{
+    Json, Router,
     body::Body,
-    extract::{State, Query, ConnectInfo},
+    extract::{ConnectInfo, State},
+    http::{Request, StatusCode},
     middleware::Next,
-    http::Request,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
-    Json, 
-    Router,
 };
-use chrono::{DateTime, Utc, Local};
-use serde::{Deserialize, Serialize};
-use sqlx::{mysql::MySqlPoolOptions, FromRow, MySql, Pool};
+use config::Config;
+use schema::Schema;
+use sqlx::mysql::MySqlPoolOptions;
+use state::AppState;
 use std::net::SocketAddr;
-use std::time::Instant;
-
-
-#[derive(Clone)]
-struct AppState {
-    pool: Pool<MySql>,
-}
-
-
-#[derive(Deserialize, Clone)]
-struct Config {
-    general: GeneralConfig,
-    database: DatabaseConfig,
-}
-
-#[derive(Deserialize, Clone)]
-struct GeneralConfig {
-    bind_addr: String,
-    bind_port: u16,
-}
-
-#[derive(Deserialize, Clone)]
-struct DatabaseConfig {
-    host: String,
-    port: u16,
-    user: String,
-    password: String,
-    database: String,
-}
-
-#[derive(Deserialize)]
-struct CountParams {
-    subnet_id: Option<u32>,
-}
-
-#[derive(Serialize, FromRow)]
-struct Lease4 {
-    address: Option<String>,
-    hwaddr: Option<String>,
-    client_id: Option<String>,
-    valid_lifetime: Option<u32>,
-    expire: Option<DateTime<Utc>>,
-    subnet_id: Option<u32>,
-    hostname: Option<String>,
-}
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tower_http::timeout::TimeoutLayer;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-
+    // RUST_LOG があれば従い、無ければ info。v0.1 は info 固定だった。
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_line_number(false)
-        .with_file(false)
-        .with_env_filter("info")  // 固定INFO
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
-    let config_str = std::fs::read_to_string("config.toml")
-        .context("Failed to read config.toml")?;
-    let config: Config = toml::from_str(&config_str)
-        .context("Failed to parse config.toml")?;
-
-    let database_url = format!(
-        "mysql://{user}:{password}@{host}:{port}/{database}",
-        user = config.database.user,
-        password = config.database.password,
-        host = config.database.host,
-        port = config.database.port,
-        database = config.database.database
-    );
+    let config_path = config::config_path_hint();
+    let config = Config::load()?;
+    tracing::info!("設定ファイル: {}", config_path.as_ref().display());
 
     let pool = MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+        .max_connections(config.database.max_connections)
+        .acquire_timeout(Duration::from_secs(config.database.connect_timeout_secs))
+        .connect_with(config.database.connect_options())
         .await
-        .context("Failed to connect to database")?;
+        .with_context(|| {
+            format!(
+                "データベースに接続できませんでした: {}",
+                config.database.display_target()
+            )
+        })?;
+    tracing::info!("接続先データベース: {}", config.database.display_target());
 
-    let state = AppState { pool };
+    let schema = Schema::detect(&pool)
+        .await
+        .context("Kea のスキーマを確認できませんでした")?;
+    log_schema(&schema, &pool).await;
+
+    let app_state = AppState {
+        pool,
+        schema: Arc::new(schema),
+        max_limit: config.general.max_limit,
+        trust_proxy_header: config.general.trust_proxy_header,
+    };
 
     let app = Router::new()
-        .route("/", get(list_leases))
-        .route("/leases", get(list_leases))
-        .route("/leases/count", get(count_leases))
-        .with_state(state)
-        .layer(axum::middleware::from_fn(log_real_ip));
+        .route("/", get(handlers::list_leases4))
+        .route("/leases", get(handlers::list_leases4))
+        .route("/leases/count", get(handlers::count_leases4))
+        .route("/leases/{address}", get(handlers::get_lease4))
+        .route("/leases6", get(handlers::list_leases6))
+        .route("/leases6/count", get(handlers::count_leases6))
+        .route("/leases6/{address}", get(handlers::get_lease6))
+        .route("/stats", get(stats::stats))
+        .route("/metrics", get(stats::metrics))
+        .route("/healthz", get(stats::healthz))
+        .fallback(not_found)
+        .with_state(app_state.clone())
+        // 遅い問い合わせで接続を握り続けないよう頭を押さえる。
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(config.general.request_timeout_secs),
+        ))
+        // ログは最外周に置いて、タイムアウトした応答も記録できるようにする。
+        .layer(axum::middleware::from_fn_with_state(app_state, log_request));
 
-    let bind_setting = config.general.bind_addr + ":" + &config.general.bind_port.to_string();
-    println!("try binding on {}", bind_setting);
-
-    let listener = tokio::net::TcpListener::bind(bind_setting.clone())
+    let bind_address = config.bind_address();
+    let listener = tokio::net::TcpListener::bind(&bind_address)
         .await
-        .context("Failed to bind")?;
-    
-    println!("listening on {}", bind_setting);
-    println!("Using DB: {}", database_url.replace(&config.database.password, "*****"));
+        .with_context(|| format!("待ち受けを開始できませんでした: {bind_address}"))?;
+    tracing::info!("listening on {bind_address}");
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .context("Server failed")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("サーバが異常終了しました")?;
 
+    tracing::info!("停止しました");
     Ok(())
 }
 
-async fn list_leases(
-        State(state): State<AppState>,
-    ) -> Json<Vec<Lease4>> {
-    let rows = sqlx::query_as!(
-        Lease4,
-        r#"
-        SELECT 
-            INET_NTOA(address) as address,
-            HEX(hwaddr) as hwaddr,
-            CASE WHEN client_id IS NULL THEN NULL ELSE HEX(client_id) END as client_id,
-            valid_lifetime,
-            expire,
-            subnet_id,
-            hostname
-        FROM lease4 
-        ORDER BY address
-        "#
-    )
-    .fetch_all(&state.pool)
-    .await
-    .expect("query failed");
-
-    Json(rows)
+/// 起動時に、接続先スキーマから見えた情報を出しておく。
+/// 「新しい項目が全部 null で返る」ときの切り分けが楽になる。
+async fn log_schema(schema: &Schema, pool: &sqlx::Pool<sqlx::MySql>) {
+    match schema::schema_version(pool).await {
+        Some(version) => tracing::info!("Kea スキーマバージョン: {version}"),
+        None => tracing::warn!("schema_version テーブルを読めませんでした"),
+    }
+    tracing::info!(
+        "lease4: {} / lease6: {}",
+        if schema.has_lease4() {
+            "あり"
+        } else {
+            "なし"
+        },
+        if schema.has_lease6() {
+            "あり"
+        } else {
+            "なし"
+        }
+    );
+    for (table, columns) in [
+        (
+            "lease4",
+            ["state", "pool_id", "relay_id", "remote_id"].as_slice(),
+        ),
+        ("lease6", ["state", "pool_id"].as_slice()),
+    ] {
+        let missing: Vec<&str> = columns
+            .iter()
+            .copied()
+            .filter(|column| match table {
+                "lease4" => schema.has_lease4() && !schema.lease4_has(column),
+                _ => schema.has_lease6() && !schema.lease6_has(column),
+            })
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                "{table} に無い列があります (該当項目は null で返します): {}",
+                missing.join(", ")
+            );
+        }
+    }
 }
 
-async fn count_leases(
-    State(state): State<AppState>,
-    Query(params): Query<CountParams>,
-) -> Json<i64> {
-    let count = if let Some(subnet_id) = params.subnet_id {
-        // subnet_id 指定あり
-        let row = sqlx::query!(
-            r#"SELECT COUNT(*) as "count!" FROM lease4 WHERE subnet_id = ?"#,
-            subnet_id as u32
-        )
-        .fetch_one(&state.pool)
-        .await
-        .expect("count query failed");
-        row.count
-    } else {
-        // subnet_id 指定なし
-        let row = sqlx::query!(
-            r#"SELECT COUNT(*) as "count!" FROM lease4"#,
-        )
-        .fetch_one(&state.pool)
-        .await
-        .expect("count query failed");
-        row.count
-    };
-
-    Json(count)
-}
-
-async fn log_real_ip(
+/// アクセスログ。v0.1 は受信時と応答時で 2 行に分かれていたため、
+/// 同時アクセス時にどの行が対になるのか分からなかった。1 行にまとめる。
+async fn log_request(
+    State(app): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request<Body>,
     next: Next,
-) -> impl IntoResponse {
+) -> Response {
     let start = Instant::now();
-    let query = req.uri().query().unwrap_or("");
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let client_ip = client_ip(&app, &addr, &req);
 
-    let client_ip: String;
+    let response = next.run(req).await;
 
-    if addr.ip().to_string().starts_with("::ffff:"){
-        client_ip = addr.ip().to_string().strip_prefix("::ffff:").unwrap().to_string();
-    }else{
-        client_ip = addr.ip().to_string();
-    }
-    
     tracing::info!(
-        "[REQ] time=\"{}\" client_ip=\"{}\" path=\"{}\" query=\"{}\"",
-        Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z"),
-        client_ip,
-        req.uri().path(),
-        query
+        "client_ip=\"{client_ip}\" method={method} path=\"{path}\" query=\"{query}\" status={} latency={:.2?}",
+        response.status().as_u16(),
+        start.elapsed()
     );
+    response
+}
 
-    let res = next.run(req).await;
-    let latency = start.elapsed();
-    tracing::info!("[RES] status={} latency={:.2?}", res.status(), latency);
-    
-    res
+/// クライアント IP を求める。
+///
+/// IPv6 ソケットで待つと IPv4 の接続が `::ffff:192.0.2.1` に見えるので、
+/// v0.1 と同様にほどく。リバースプロキシ配下では設定で
+/// `trust_proxy_header = true` にすると X-Forwarded-For を優先する。
+fn client_ip(app: &AppState, addr: &SocketAddr, req: &Request<Body>) -> String {
+    if app.trust_proxy_header
+        && let Some(forwarded) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        return forwarded.to_string();
+    }
+
+    let ip = addr.ip().to_string();
+    ip.strip_prefix("::ffff:").unwrap_or(&ip).to_string()
+}
+
+async fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "not_found",
+            "message": "そのようなエンドポイントはありません",
+            "endpoints": [
+                "/leases", "/leases/count", "/leases/{address}",
+                "/leases6", "/leases6/count", "/leases6/{address}",
+                "/stats", "/metrics", "/healthz"
+            ]
+        })),
+    )
+        .into_response()
+}
+
+/// SIGINT / SIGTERM を受けたら、処理中のリクエストを捌き切ってから終了する。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!("SIGTERM を待ち受けられませんでした: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("SIGINT を受信しました"),
+        _ = terminate => tracing::info!("SIGTERM を受信しました"),
+    }
 }

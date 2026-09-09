@@ -1,0 +1,37 @@
+[Unit]
+Description=Kea lease API
+Documentation=https://github.com/panakuma/kea-lease-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/kea_lease-db_api /etc/kea-lease-api/config.toml
+Restart=on-failure
+RestartSec=5s
+User=kea-lease-api
+Group=kea-lease-api
+
+# パスワードを config.toml に置かない場合は、
+# KEA_LEASE_API_DB_PASSWORD=... を書いたファイルを指定する。
+# EnvironmentFile=/etc/kea-lease-api/secret.env
+
+# ログの詳細度
+# Environment=RUST_LOG=info
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
