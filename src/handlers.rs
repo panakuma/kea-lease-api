@@ -1,90 +1,31 @@
 //! リース情報 API のハンドラ。
+//!
+//! 接続先スキーマ由来の差 (使える列、address の持ち方) は `capability` が
+//! 吸収するので、ここでは v4 / v6 を同じ形で扱える。
 
+use crate::capability::{Family, LeaseCapability, arguments};
 use crate::error::{ApiError, ApiResult};
 use crate::lease::{HwaddrFormat, Lease4, Lease6};
-use crate::query::{Family, LeaseQuery, Plan, arguments};
-use crate::schema::Schema;
+use crate::query::{LeaseQuery, Plan};
 use crate::state::AppState;
 use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use std::net::{Ipv4Addr, Ipv6Addr};
-
-/// lease4 の SELECT リスト。列があるものだけを並べる。
-pub fn lease4_select_list(schema: &Schema) -> String {
-    // HEX() は引数が NULL なら NULL を返すので、NULL 判定は不要。
-    let mut columns = vec![
-        "INET_NTOA(lease4.address) AS address".to_string(),
-        "HEX(lease4.hwaddr) AS hwaddr".to_string(),
-        "HEX(lease4.client_id) AS client_id".to_string(),
-        "lease4.valid_lifetime".to_string(),
-        "lease4.expire".to_string(),
-        "lease4.subnet_id".to_string(),
-        "lease4.hostname".to_string(),
-    ];
-    for column in ["state", "pool_id", "fqdn_fwd", "fqdn_rev", "user_context"] {
-        if schema.lease4_has(column) {
-            columns.push(format!("lease4.{column}"));
-        }
-    }
-    for column in ["relay_id", "remote_id"] {
-        if schema.lease4_has(column) {
-            columns.push(format!("HEX(lease4.{column}) AS {column}"));
-        }
-    }
-    columns.join(", ")
-}
-
-/// lease6 の SELECT リスト。address は VARCHAR なので変換しない。
-pub fn lease6_select_list(schema: &Schema) -> String {
-    let mut columns = vec![
-        "lease6.address".to_string(),
-        "HEX(lease6.duid) AS duid".to_string(),
-        "lease6.valid_lifetime".to_string(),
-        "lease6.expire".to_string(),
-        "lease6.subnet_id".to_string(),
-        "lease6.pref_lifetime".to_string(),
-        "lease6.lease_type".to_string(),
-        "lease6.iaid".to_string(),
-        "lease6.prefix_len".to_string(),
-        "lease6.hostname".to_string(),
-    ];
-    for column in [
-        "state",
-        "pool_id",
-        "fqdn_fwd",
-        "fqdn_rev",
-        "user_context",
-        "hwtype",
-        "hwaddr_source",
-    ] {
-        if schema.lease6_has(column) {
-            columns.push(format!("lease6.{column}"));
-        }
-    }
-    if schema.lease6_has("hwaddr") {
-        columns.push("HEX(lease6.hwaddr) AS hwaddr".to_string());
-    }
-    columns.join(", ")
-}
+use sqlx::mysql::MySqlRow;
 
 /// `GET /` `GET /leases`
 pub async fn list_leases4(
     State(state): State<AppState>,
     Query(query): Query<LeaseQuery>,
 ) -> ApiResult<Json<Vec<Lease4>>> {
-    state.require_lease4()?;
-    let plan = Plan::build(&query, Family::V4, &state.schema, state.max_limit)?;
-    let (sql, binds) = plan.select(&lease4_select_list(&state.schema), "lease4");
-
-    let rows = sqlx::query_with(&sql, arguments(&binds)?)
-        .fetch_all(&state.pool)
-        .await?;
+    let capability = state.capability(Family::V4)?;
+    let plan = Plan::build(&query, capability, state.max_limit)?;
+    let rows = fetch_all(&state, &plan, capability).await?;
 
     Ok(Json(
         rows.iter()
-            .map(|row| Lease4::from_row(row, &state.schema, plan.hwaddr_format))
+            .map(|row| Lease4::from_row(row, capability, plan.hwaddr_format))
             .collect(),
     ))
 }
@@ -96,15 +37,9 @@ pub async fn count_leases4(
     State(state): State<AppState>,
     Query(query): Query<LeaseQuery>,
 ) -> ApiResult<Json<i64>> {
-    state.require_lease4()?;
-    let plan = Plan::build(&query, Family::V4, &state.schema, state.max_limit)?;
-    let (sql, binds) = plan.count("lease4");
-
-    let count: i64 = sqlx::query_scalar_with(&sql, arguments(&binds)?)
-        .fetch_one(&state.pool)
-        .await?;
-
-    Ok(Json(count))
+    let capability = state.capability(Family::V4)?;
+    let plan = Plan::build(&query, capability, state.max_limit)?;
+    Ok(Json(count(&state, &plan, capability).await?))
 }
 
 /// `GET /leases/{address}`
@@ -115,26 +50,10 @@ pub async fn get_lease4(
     Path(address): Path<String>,
     Query(query): Query<AddressQuery>,
 ) -> ApiResult<Json<Lease4>> {
-    state.require_lease4()?;
-    let parsed: Ipv4Addr = address.parse().map_err(|_| {
-        ApiError::bad_request(format!("IPv4 アドレスとして解釈できません: {address}"))
-    })?;
+    let capability = state.capability(Family::V4)?;
     let hwaddr_format = query.hwaddr_format()?;
-
-    let sql = format!(
-        "SELECT {} FROM lease4 WHERE lease4.address = ?",
-        lease4_select_list(&state.schema)
-    );
-    let mut args = sqlx::mysql::MySqlArguments::default();
-    sqlx::Arguments::add(&mut args, u32::from(parsed))
-        .map_err(|error| ApiError::Database(sqlx::Error::Encode(error)))?;
-
-    let row = sqlx::query_with(&sql, args)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("リースが見つかりません: {parsed}")))?;
-
-    Ok(Json(Lease4::from_row(&row, &state.schema, hwaddr_format)))
+    let row = fetch_one(&state, capability, &address).await?;
+    Ok(Json(Lease4::from_row(&row, capability, hwaddr_format)))
 }
 
 /// `GET /leases6`
@@ -142,17 +61,13 @@ pub async fn list_leases6(
     State(state): State<AppState>,
     Query(query): Query<LeaseQuery>,
 ) -> ApiResult<Json<Vec<Lease6>>> {
-    state.require_lease6()?;
-    let plan = Plan::build(&query, Family::V6, &state.schema, state.max_limit)?;
-    let (sql, binds) = plan.select(&lease6_select_list(&state.schema), "lease6");
-
-    let rows = sqlx::query_with(&sql, arguments(&binds)?)
-        .fetch_all(&state.pool)
-        .await?;
+    let capability = state.capability(Family::V6)?;
+    let plan = Plan::build(&query, capability, state.max_limit)?;
+    let rows = fetch_all(&state, &plan, capability).await?;
 
     Ok(Json(
         rows.iter()
-            .map(|row| Lease6::from_row(row, &state.schema, plan.hwaddr_format))
+            .map(|row| Lease6::from_row(row, capability, plan.hwaddr_format))
             .collect(),
     ))
 }
@@ -162,15 +77,9 @@ pub async fn count_leases6(
     State(state): State<AppState>,
     Query(query): Query<LeaseQuery>,
 ) -> ApiResult<Json<i64>> {
-    state.require_lease6()?;
-    let plan = Plan::build(&query, Family::V6, &state.schema, state.max_limit)?;
-    let (sql, binds) = plan.count("lease6");
-
-    let count: i64 = sqlx::query_scalar_with(&sql, arguments(&binds)?)
-        .fetch_one(&state.pool)
-        .await?;
-
-    Ok(Json(count))
+    let capability = state.capability(Family::V6)?;
+    let plan = Plan::build(&query, capability, state.max_limit)?;
+    Ok(Json(count(&state, &plan, capability).await?))
 }
 
 /// `GET /leases6/{address}`
@@ -179,40 +88,48 @@ pub async fn get_lease6(
     Path(address): Path<String>,
     Query(query): Query<AddressQuery>,
 ) -> ApiResult<Json<Lease6>> {
-    state.require_lease6()?;
-    let parsed: Ipv6Addr = address.parse().map_err(|_| {
-        ApiError::bad_request(format!("IPv6 アドレスとして解釈できません: {address}"))
-    })?;
+    let capability = state.capability(Family::V6)?;
     let hwaddr_format = query.hwaddr_format()?;
+    let row = fetch_one(&state, capability, &address).await?;
+    Ok(Json(Lease6::from_row(&row, capability, hwaddr_format)))
+}
 
-    let mut args = sqlx::mysql::MySqlArguments::default();
-    let sql = if state.schema.lease6_address_is_binary() {
-        // スキーマ 19.0 以降は BINARY(16)。16 バイトを直接束縛すれば
-        // 主キーがそのまま効き、表記ゆれ (2001:0db8:: と 2001:db8::) も吸収できる。
-        sqlx::Arguments::add(&mut args, parsed.octets().to_vec())
-            .map_err(|error| ApiError::Database(sqlx::Error::Encode(error)))?;
-        format!(
-            "SELECT {} FROM lease6 WHERE lease6.address = ?",
-            lease6_select_list(&state.schema)
-        )
-    } else {
-        // 18 以前はテキスト。正規化した表記と入力そのままの両方で突き合わせる。
-        for value in [parsed.to_string(), address.clone()] {
-            sqlx::Arguments::add(&mut args, value)
-                .map_err(|error| ApiError::Database(sqlx::Error::Encode(error)))?;
-        }
-        format!(
-            "SELECT {} FROM lease6 WHERE lease6.address IN (?, ?)",
-            lease6_select_list(&state.schema)
-        )
-    };
+async fn fetch_all(
+    state: &AppState,
+    plan: &Plan,
+    capability: &LeaseCapability,
+) -> ApiResult<Vec<MySqlRow>> {
+    let (sql, binds) = plan.select(capability);
+    Ok(sqlx::query_with(&sql, arguments(&binds)?)
+        .fetch_all(&state.pool)
+        .await?)
+}
 
-    let row = sqlx::query_with(&sql, args)
+async fn count(state: &AppState, plan: &Plan, capability: &LeaseCapability) -> ApiResult<i64> {
+    let (sql, binds) = plan.count(capability);
+    Ok(sqlx::query_scalar_with(&sql, arguments(&binds)?)
+        .fetch_one(&state.pool)
+        .await?)
+}
+
+/// アドレスを名指しして 1 件引く。
+async fn fetch_one(
+    state: &AppState,
+    capability: &LeaseCapability,
+    address: &str,
+) -> ApiResult<MySqlRow> {
+    let lookup = capability.address_lookup(address)?;
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {}",
+        capability.select_list(),
+        capability.table(),
+        lookup.predicate
+    );
+
+    sqlx::query_with(&sql, arguments(&lookup.binds)?)
         .fetch_optional(&state.pool)
         .await?
-        .ok_or_else(|| ApiError::not_found(format!("リースが見つかりません: {parsed}")))?;
-
-    Ok(Json(Lease6::from_row(&row, &state.schema, hwaddr_format)))
+        .ok_or_else(|| ApiError::not_found(format!("リースが見つかりません: {}", lookup.canonical)))
 }
 
 /// 1 件取得時に受け付けるパラメータ。

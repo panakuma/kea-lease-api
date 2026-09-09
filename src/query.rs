@@ -7,35 +7,11 @@
 //! ここではランタイムクエリに切り替え、値はすべてプレースホルダで
 //! バインドする (SQL に文字列を埋め込まない)。
 
+use crate::capability::{Bind, Family, LeaseCapability};
 use crate::error::{ApiError, ApiResult};
 use crate::lease::HwaddrFormat;
 use crate::schema::Schema;
 use serde::Deserialize;
-use sqlx::Arguments;
-use sqlx::mysql::MySqlArguments;
-
-/// 対象テーブル。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Family {
-    V4,
-    V6,
-}
-
-impl Family {
-    pub fn table(self) -> &'static str {
-        match self {
-            Family::V4 => "lease4",
-            Family::V6 => "lease6",
-        }
-    }
-
-    fn has_column(self, schema: &Schema, column: &str) -> bool {
-        match self {
-            Family::V4 => schema.lease4_has(column),
-            Family::V6 => schema.lease6_has(column),
-        }
-    }
-}
 
 /// `/leases` `/leases6` `/leases/count` が受け取るクエリパラメータ。
 ///
@@ -68,13 +44,6 @@ pub struct LeaseQuery {
     pub hwaddr_format: Option<String>,
 }
 
-/// バインドする値。型ごとに持たないと sqlx に渡せない。
-#[derive(Debug, Clone)]
-pub enum Bind {
-    U32(u32),
-    Str(String),
-}
-
 /// 解決済みのクエリ。
 #[derive(Debug)]
 pub struct Plan {
@@ -90,26 +59,21 @@ impl Plan {
     /// クエリパラメータを検証して SQL の断片に落とす。
     pub fn build(
         query: &LeaseQuery,
-        family: Family,
-        schema: &Schema,
+        capability: &LeaseCapability,
         max_limit: u32,
     ) -> ApiResult<Self> {
-        let table = family.table();
+        let table = capability.table();
         let mut conditions: Vec<String> = Vec::new();
         let mut binds: Vec<Bind> = Vec::new();
 
         // --- state ---------------------------------------------------------
         // state 列が無い古いスキーマでは絞りようがないので、指定が無ければ素通し。
-        let has_state = family.has_column(schema, "state");
+        let has_state = capability.has("state");
         match query.state.as_deref() {
             Some(value) if value.eq_ignore_ascii_case("all") => {}
             Some(value) => {
-                if !has_state {
-                    return Err(ApiError::bad_request(format!(
-                        "接続先の {table} テーブルには state 列がありません (Kea スキーマ 3.0 以降が必要です)"
-                    )));
-                }
-                let state = resolve_state(value, schema)?;
+                capability.require_column("state")?;
+                let state = resolve_state(value, capability.schema())?;
                 conditions.push(format!("{table}.state = ?"));
                 binds.push(Bind::U32(state));
             }
@@ -135,11 +99,7 @@ impl Plan {
             binds.push(Bind::U32(subnet_id));
         }
         if let Some(pool_id) = query.pool_id {
-            if !family.has_column(schema, "pool_id") {
-                return Err(ApiError::bad_request(format!(
-                    "接続先の {table} テーブルには pool_id 列がありません (Kea スキーマ 18 以降が必要です)"
-                )));
-            }
+            capability.require_column("pool_id")?;
             conditions.push(format!("{table}.pool_id = ?"));
             binds.push(Bind::U32(pool_id));
         }
@@ -151,7 +111,7 @@ impl Plan {
             binds.push(Bind::Str(prefix));
         }
         if let Some(duid) = query.duid.as_deref() {
-            if family != Family::V6 {
+            if capability.family() != Family::V6 {
                 return Err(ApiError::bad_request(
                     "duid は IPv6 のリース (/leases6) でのみ指定できます",
                 ));
@@ -174,24 +134,19 @@ impl Plan {
         // INET_NTOA() した別名と実列が同名なので、修飾しないと MySQL は
         // 別名 (文字列) を採用してしまい 192.0.2.9 が 192.0.2.10 より
         // 後ろに並ぶ。
-        let order_column = match query.order_by.as_deref().unwrap_or("address") {
-            "address" => "address",
-            "expire" => "expire",
-            "hostname" => "hostname",
-            "subnet_id" => "subnet_id",
-            "state" if has_state => "state",
-            other => {
-                // state 列が無い環境では state を候補に出さない。
-                let mut allowed = vec!["address", "expire", "hostname", "subnet_id"];
-                if has_state {
-                    allowed.push("state");
-                }
-                return Err(ApiError::bad_request(format!(
-                    "order_by に指定できるのは {} です (指定値: {other})",
-                    allowed.join(", ")
-                )));
-            }
-        };
+        // 指定できる列は接続先スキーマ次第 (state 列が無ければ候補にも出さない)。
+        let requested = query.order_by.as_deref().unwrap_or("address");
+        let order_column = capability
+            .order_columns()
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == requested)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "order_by に指定できるのは {} です (指定値: {requested})",
+                    capability.order_columns().join(", ")
+                ))
+            })?;
         let direction = if query.desc.unwrap_or(false) {
             "DESC"
         } else {
@@ -238,8 +193,13 @@ impl Plan {
     }
 
     /// 一覧取得用の SQL とバインド値。
-    pub fn select(&self, select_list: &str, table: &str) -> (String, Vec<Bind>) {
-        let mut sql = format!("SELECT {select_list} FROM {table}{}", self.where_sql);
+    pub fn select(&self, capability: &LeaseCapability) -> (String, Vec<Bind>) {
+        let mut sql = format!(
+            "SELECT {} FROM {}{}",
+            capability.select_list(),
+            capability.table(),
+            self.where_sql
+        );
         sql.push_str(&self.order_sql);
         let mut binds = self.binds.clone();
         if let Some(limit) = self.limit {
@@ -254,29 +214,16 @@ impl Plan {
     }
 
     /// 件数取得用の SQL とバインド値。並び順と LIMIT は意味がないので付けない。
-    pub fn count(&self, table: &str) -> (String, Vec<Bind>) {
+    pub fn count(&self, capability: &LeaseCapability) -> (String, Vec<Bind>) {
         (
-            format!("SELECT COUNT(*) FROM {table}{}", self.where_sql),
+            format!(
+                "SELECT COUNT(*) FROM {}{}",
+                capability.table(),
+                self.where_sql
+            ),
             self.binds.clone(),
         )
     }
-}
-
-/// バインド値を sqlx の引数列に詰める。
-pub fn arguments(binds: &[Bind]) -> ApiResult<MySqlArguments> {
-    let mut args = MySqlArguments::default();
-    for bind in binds {
-        let result = match bind {
-            Bind::U32(value) => args.add(*value),
-            Bind::Str(value) => args.add(value.as_str()),
-        };
-        result.map_err(|error| {
-            ApiError::Database(sqlx::Error::Encode(
-                format!("クエリ引数を組み立てられませんでした: {error}").into(),
-            ))
-        })?;
-    }
-    Ok(args)
 }
 
 /// `state=released` のような名前、または `state=3` のような数値を解決する。

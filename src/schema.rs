@@ -127,6 +127,30 @@ impl Schema {
     }
 }
 
+#[cfg(test)]
+impl Schema {
+    /// 列一覧だけを与えて組み立てる。接続先スキーマ違いの分岐を
+    /// DB 無しで確かめるためのもの。
+    pub fn from_columns(lease4: &[(&str, &str)], lease6: &[(&str, &str)]) -> Self {
+        fn columns(entries: &[(&str, &str)]) -> HashMap<String, String> {
+            entries
+                .iter()
+                .map(|(name, data_type)| (name.to_string(), data_type.to_string()))
+                .collect()
+        }
+        Self {
+            lease4_columns: columns(lease4),
+            lease6_columns: columns(lease6),
+            lease_states: BUILTIN_LEASE_STATES
+                .iter()
+                .map(|(state, name)| (*state, name.to_string()))
+                .collect(),
+            lease6_types: BTreeMap::new(),
+            hwaddr_sources: BTreeMap::new(),
+        }
+    }
+}
+
 /// lease_state が読めなかったときに使う、Kea が定義している既知の値。
 /// メトリクスのラベルが環境によって `state-0` になったり `default` に
 /// なったりしないよう、名前は常に引けるようにしておく。

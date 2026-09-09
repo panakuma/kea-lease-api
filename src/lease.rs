@@ -3,11 +3,10 @@
 //! 列は Kea のバージョンで増減するので、`#[derive(FromRow)]` ではなく
 //! 「あれば読む、無ければ null」で組み立てる。
 
-use crate::schema::Schema;
+use crate::capability::{LeaseCapability, optional};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
-use sqlx::{MySql, Row, mysql::MySqlRow};
-use std::net::Ipv6Addr;
+use sqlx::mysql::MySqlRow;
 
 /// MAC アドレス等のバイナリ列の見せ方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,13 +71,18 @@ pub struct Lease4 {
 }
 
 impl Lease4 {
-    pub fn from_row(row: &MySqlRow, schema: &Schema, hwaddr_format: HwaddrFormat) -> Self {
+    pub fn from_row(
+        row: &MySqlRow,
+        capability: &LeaseCapability,
+        hwaddr_format: HwaddrFormat,
+    ) -> Self {
+        let schema = capability.schema();
         let valid_lifetime: Option<u32> = optional(row, "valid_lifetime");
         let expire: Option<DateTime<Utc>> = optional(row, "expire");
         let state: Option<u32> = optional(row, "state");
 
         Self {
-            address: optional(row, "address"),
+            address: capability.address(row),
             hwaddr: hwaddr_format.apply(optional(row, "hwaddr")),
             client_id: optional(row, "client_id"),
             valid_lifetime,
@@ -128,7 +132,12 @@ pub struct Lease6 {
 }
 
 impl Lease6 {
-    pub fn from_row(row: &MySqlRow, schema: &Schema, hwaddr_format: HwaddrFormat) -> Self {
+    pub fn from_row(
+        row: &MySqlRow,
+        capability: &LeaseCapability,
+        hwaddr_format: HwaddrFormat,
+    ) -> Self {
+        let schema = capability.schema();
         let valid_lifetime: Option<u32> = optional(row, "valid_lifetime");
         let expire: Option<DateTime<Utc>> = optional(row, "expire");
         let state: Option<u32> = optional(row, "state");
@@ -136,7 +145,7 @@ impl Lease6 {
         let hwaddr_source: Option<u32> = optional(row, "hwaddr_source");
 
         Self {
-            address: lease6_address(row, schema),
+            address: capability.address(row),
             duid: hwaddr_format.apply(optional(row, "duid")),
             valid_lifetime,
             expire,
@@ -166,44 +175,6 @@ impl Lease6 {
             user_context: optional::<String>(row, "user_context").map(user_context),
         }
     }
-}
-
-/// 列があれば読み、無ければ None。
-///
-/// SELECT リストは接続先スキーマに合わせて組み立てているので
-/// `ColumnNotFound` は想定内。デコードに失敗した場合も、1 件のために
-/// 応答全体を落とすより null で返したほうが実用的なのでログに残して続行する。
-fn optional<'r, T>(row: &'r MySqlRow, name: &str) -> Option<T>
-where
-    T: sqlx::Decode<'r, MySql> + sqlx::Type<MySql>,
-{
-    match row.try_get::<Option<T>, _>(name) {
-        Ok(value) => value,
-        Err(sqlx::Error::ColumnNotFound(_)) => None,
-        Err(error) => {
-            tracing::warn!("列 {name} を読めませんでした: {error}");
-            None
-        }
-    }
-}
-
-/// lease6.address を文字列にする。
-///
-/// Kea スキーマ 19.0 以降は BINARY(16) の生アドレスなので、DB の
-/// INET6_NTOA() に頼らず Rust 側で RFC 5952 の表記へ整える。
-/// 18 以前は VARCHAR(39) のテキストなのでそのまま読む。
-fn lease6_address(row: &MySqlRow, schema: &Schema) -> Option<String> {
-    if schema.lease6_address_is_binary() {
-        optional::<Vec<u8>>(row, "address").and_then(format_ipv6)
-    } else {
-        optional(row, "address")
-    }
-}
-
-/// BINARY(16) の 16 バイトを IPv6 アドレス表記にする。
-fn format_ipv6(bytes: Vec<u8>) -> Option<String> {
-    let octets: [u8; 16] = bytes.try_into().ok()?;
-    Some(Ipv6Addr::from(octets).to_string())
 }
 
 /// Kea は cltt (最終通信時刻) を DB に持たず expire = cltt + valid_lifetime と
@@ -248,22 +219,6 @@ mod tests {
     fn cltt_needs_both_values() {
         assert!(cltt(None, Some(3600)).is_none());
         assert!(cltt(Some(Utc::now()), None).is_none());
-    }
-
-    #[test]
-    fn binary_address_is_formatted_as_ipv6() {
-        let mut octets = vec![0u8; 16];
-        octets[0] = 0x20;
-        octets[1] = 0x01;
-        octets[2] = 0x0d;
-        octets[3] = 0xb8;
-        octets[15] = 0x01;
-        assert_eq!(format_ipv6(octets).as_deref(), Some("2001:db8::1"));
-    }
-
-    #[test]
-    fn binary_address_needs_16_bytes() {
-        assert!(format_ipv6(vec![0u8; 4]).is_none());
     }
 
     #[test]

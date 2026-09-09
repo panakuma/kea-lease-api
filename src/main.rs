@@ -1,6 +1,7 @@
 //! ISC Kea の MySQL / MariaDB バックエンドからリース情報を読み出して
 //! JSON で返す HTTP API サーバ。
 
+mod capability;
 mod config;
 mod error;
 mod handlers;
@@ -20,6 +21,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use capability::{Family, LeaseCapability};
 use config::Config;
 use schema::Schema;
 use sqlx::mysql::MySqlPoolOptions;
@@ -57,14 +59,20 @@ async fn main() -> anyhow::Result<()> {
         })?;
     tracing::info!("接続先データベース: {}", config.database.display_target());
 
-    let schema = Schema::detect(&pool)
-        .await
-        .context("Kea のスキーマを確認できませんでした")?;
-    log_schema(&schema, &pool).await;
+    let schema = Arc::new(
+        Schema::detect(&pool)
+            .await
+            .context("Kea のスキーマを確認できませんでした")?,
+    );
+    let lease4 = Arc::new(LeaseCapability::detect(Family::V4, schema.clone()));
+    let lease6 = Arc::new(LeaseCapability::detect(Family::V6, schema.clone()));
+    log_capabilities(&pool, &lease4, &lease6).await;
 
     let app_state = AppState {
         pool,
-        schema: Arc::new(schema),
+        schema,
+        lease4,
+        lease6,
         max_limit: config.general.max_limit,
         trust_proxy_header: config.general.trust_proxy_header,
     };
@@ -110,42 +118,39 @@ async fn main() -> anyhow::Result<()> {
 
 /// 起動時に、接続先スキーマから見えた情報を出しておく。
 /// 「新しい項目が全部 null で返る」ときの切り分けが楽になる。
-async fn log_schema(schema: &Schema, pool: &sqlx::Pool<sqlx::MySql>) {
+async fn log_capabilities(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    lease4: &LeaseCapability,
+    lease6: &LeaseCapability,
+) {
     match schema::schema_version(pool).await {
         Some(version) => tracing::info!("Kea スキーマバージョン: {version}"),
         None => tracing::warn!("schema_version テーブルを読めませんでした"),
     }
     tracing::info!(
         "lease4: {} / lease6: {}",
-        if schema.has_lease4() {
-            "あり"
-        } else {
-            "なし"
-        },
-        if schema.has_lease6() {
-            "あり"
-        } else {
-            "なし"
-        }
+        if lease4.present() { "あり" } else { "なし" },
+        if lease6.present() { "あり" } else { "なし" }
     );
-    for (table, columns) in [
-        (
-            "lease4",
-            ["state", "pool_id", "relay_id", "remote_id"].as_slice(),
-        ),
-        ("lease6", ["state", "pool_id"].as_slice()),
-    ] {
-        let missing: Vec<&str> = columns
+
+    for capability in [lease4, lease6] {
+        if !capability.present() {
+            continue;
+        }
+        // 後年の Kea で追加された列。無くても動くが、該当項目は null になる。
+        let notable: &[&str] = match capability.family() {
+            Family::V4 => &["state", "pool_id", "relay_id", "remote_id"],
+            Family::V6 => &["state", "pool_id"],
+        };
+        let missing: Vec<&str> = notable
             .iter()
             .copied()
-            .filter(|column| match table {
-                "lease4" => schema.has_lease4() && !schema.lease4_has(column),
-                _ => schema.has_lease6() && !schema.lease6_has(column),
-            })
+            .filter(|column| !capability.has(column))
             .collect();
         if !missing.is_empty() {
             tracing::warn!(
-                "{table} に無い列があります (該当項目は null で返します): {}",
+                "{} に無い列があります (該当項目は null で返します): {}",
+                capability.table(),
                 missing.join(", ")
             );
         }

@@ -3,6 +3,7 @@
 //! いずれも `SELECT subnet_id, state, COUNT(*) ... GROUP BY` 1 本で済むので、
 //! 全リースを引いてから数えるより桁違いに軽い。
 
+use crate::capability::{Family, LeaseCapability};
 use crate::error::ApiResult;
 use crate::state::AppState;
 use axum::{
@@ -29,9 +30,10 @@ struct StatRow {
 /// subnet_id / state 別の件数を数える。
 async fn collect(
     pool: &Pool<MySql>,
-    table: &str,
-    has_state: bool,
+    capability: &LeaseCapability,
 ) -> Result<Vec<StatRow>, sqlx::Error> {
+    let table = capability.table();
+    let has_state = capability.has("state");
     // state 列が無い古いスキーマでは 0 (default) 相当とみなす。
     // GROUP BY に整数リテラルを書くと選択リストの序数と解釈されてしまうので、
     // 集約キー自体を出し分ける。state が 1 種類しかない以上、
@@ -134,25 +136,22 @@ fn summarize(rows: &[StatRow], app: &AppState) -> FamilyStats {
     }
 }
 
+/// テーブルが無ければ集計しない。
+async fn family_stats(app: &AppState, family: Family) -> ApiResult<Option<FamilyStats>> {
+    let capability = app.lease(family);
+    if !capability.present() {
+        return Ok(None);
+    }
+    let rows = collect(&app.pool, capability).await?;
+    Ok(Some(summarize(&rows, app)))
+}
+
 /// `GET /stats`
 pub async fn stats(State(app): State<AppState>) -> ApiResult<Json<StatsResponse>> {
-    let lease4 = if app.schema.has_lease4() {
-        let rows = collect(&app.pool, "lease4", app.schema.lease4_has("state")).await?;
-        Some(summarize(&rows, &app))
-    } else {
-        None
-    };
-    let lease6 = if app.schema.has_lease6() {
-        let rows = collect(&app.pool, "lease6", app.schema.lease6_has("state")).await?;
-        Some(summarize(&rows, &app))
-    } else {
-        None
-    };
-
     Ok(Json(StatsResponse {
         schema_version: crate::schema::schema_version(&app.pool).await,
-        lease4,
-        lease6,
+        lease4: family_stats(&app, Family::V4).await?,
+        lease6: family_stats(&app, Family::V6).await?,
     }))
 }
 
@@ -160,28 +159,18 @@ pub async fn stats(State(app): State<AppState>) -> ApiResult<Json<StatsResponse>
 pub async fn metrics(State(app): State<AppState>) -> ApiResult<Response> {
     let mut body = String::new();
 
-    for (family, table, has_state, present) in [
-        (
-            "lease4",
-            "lease4",
-            app.schema.lease4_has("state"),
-            app.schema.has_lease4(),
-        ),
-        (
-            "lease6",
-            "lease6",
-            app.schema.lease6_has("state"),
-            app.schema.has_lease6(),
-        ),
-    ] {
-        if !present {
+    for family in [Family::V4, Family::V6] {
+        let capability = app.lease(family);
+        if !capability.present() {
             continue;
         }
-        let rows = collect(&app.pool, table, has_state).await?;
+        // メトリクス名にはテーブル名をそのまま使う (kea_lease4_* / kea_lease6_*)。
+        let family = capability.table();
+        let rows = collect(&app.pool, capability).await?;
 
         let _ = writeln!(
             body,
-            "# HELP kea_{family}_leases Number of rows in the Kea {table} table."
+            "# HELP kea_{family}_leases Number of rows in the Kea {family} table."
         );
         let _ = writeln!(body, "# TYPE kea_{family}_leases gauge");
         for row in &rows {
