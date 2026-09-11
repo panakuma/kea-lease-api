@@ -9,6 +9,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
 use sqlx::mysql::MySqlRow;
 
+/// Kea の Lease::INFINITY_LFT。無期限の場合、DB の expire は cltt と等しい。
+pub const INFINITY_LFT: u32 = u32::MAX;
+
 /// MAC アドレス等のバイナリ列の見せ方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HwaddrFormat {
@@ -77,7 +80,7 @@ pub struct Lease4 {
     pub subnet_id: Option<u32>,
     pub hostname: Option<String>,
     /// client last transmission time。Kea は保持していないので
-    /// `expire - valid_lifetime` から復元した値。
+    /// `expire - valid_lifetime` から復元した値。無期限なら expire そのもの。
     pub cltt: Option<DateTime<Utc>>,
     pub state: Option<u32>,
     pub state_name: Option<String>,
@@ -197,10 +200,13 @@ impl Lease6 {
 }
 
 /// Kea は cltt (最終通信時刻) を DB に持たず expire = cltt + valid_lifetime と
-/// して保存する。ここでは逆算して返す。
+/// して保存する。無期限の場合は expire = cltt なので減算しない。
 fn cltt(expire: Option<DateTime<Utc>>, valid_lifetime: Option<u32>) -> Option<DateTime<Utc>> {
     let expire = expire?;
     let valid_lifetime = valid_lifetime?;
+    if valid_lifetime == INFINITY_LFT {
+        return Some(expire);
+    }
     expire.checked_sub_signed(TimeDelta::seconds(i64::from(valid_lifetime)))
 }
 
@@ -260,6 +266,20 @@ mod tests {
     fn cltt_needs_both_values() {
         assert!(cltt(None, Some(3600)).is_none());
         assert!(cltt(Some(Utc::now()), None).is_none());
+    }
+
+    #[test]
+    fn infinite_lifetime_keeps_stored_cltt() {
+        let stored = DateTime::parse_from_rfc3339("2026-03-31T06:49:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(cltt(Some(stored), Some(0xffff_ffff)), Some(stored));
+        assert!(cltt(None, Some(0xffff_ffff)).is_none());
+        // 無期限の隣の値は通常の有限リースとして復元する。
+        assert_eq!(
+            cltt(Some(stored), Some(0xffff_fffe)),
+            stored.checked_sub_signed(TimeDelta::seconds(0xffff_fffe))
+        );
     }
 
     #[test]

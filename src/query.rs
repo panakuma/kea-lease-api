@@ -9,7 +9,7 @@
 
 use crate::capability::{Bind, Family, LeaseCapability};
 use crate::error::{ApiError, ApiResult};
-use crate::lease::HwaddrFormat;
+use crate::lease::{HwaddrFormat, INFINITY_LFT};
 use crate::schema::Schema;
 use axum::extract::{FromRequestParts, Query};
 use axum::http::request::Parts;
@@ -114,8 +114,11 @@ impl Plan {
         // NOW() はセッションのタイムゾーンで返り、TIMESTAMP 列の比較も同じ
         // タイムゾーンで行われるので、両辺が揃う。UTC_TIMESTAMP() だと
         // セッションが UTC のときしか正しくない。
+        // 無期限リースは expire に cltt が保存されるため、時刻比較から除外する。
         if !query.include_expired.unwrap_or(false) {
-            conditions.push(format!("{table}.expire > NOW()"));
+            conditions.push(format!(
+                "({table}.valid_lifetime = {INFINITY_LFT} OR {table}.expire > NOW())"
+            ));
         }
 
         // --- 単純な等値条件 ------------------------------------------------

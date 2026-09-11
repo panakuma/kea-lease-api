@@ -69,11 +69,12 @@ database = "kea database name"
 
 ここが v0.1 からの一番大きな変更点です。
 
-Keaは失効したリースを`lease4`から削除しません。`state`列の値を`expired-reclaimed`(2)に書き換えて残します。
-`declined`(1)、`released`(3)、`registered`(4)も同様に残ります。
-そのため単純に全行を数えると、DHCPサーバを動かし続けるほど実際の使用数から離れていきます。
+Keaは期限切れリースを回収するとき、設定に応じて削除するか、`state`を`expired-reclaimed`(2)に変更して保持します。
+保持したリースも、`hold-reclaimed-time`と`flush-reclaimed-timer-wait-time`の設定に従って削除されます。
+テーブルには回収待ちの期限切れリースや、`declined`(1)、`released`(3)、`registered`(4)のリースも存在しうるため、全行数は有効なリース数と一致するとは限りません。
 
-そこで `/leases` と `/leases/count` は、既定で **`state` が `default`(0) かつ `expire` が未来のもの** だけを返します。
+そこで `/leases` と `/leases/count` は、既定で **`state` が `default`(0) かつ、無期限または `expire` が未来のもの** だけを返します。IPv6も同じ判定です。
+`valid_lifetime = 4294967295`はKeaの無期限リースです。この場合、DBの`expire`には`cltt`が保存されるため、`expire`が過去でも期限切れにはしません。
 v0.1と同じ「テーブルの全行」が欲しい場合は `?state=all&include_expired=true` を付けてください。
 
 ```sh
@@ -102,7 +103,7 @@ curl '192.0.2.1:3000/leases/count?state=all&include_expired=true' # テーブル
 知らないパラメータを渡すと400を返します。`subnetid=1`のような綴り間違いが「絞ったつもりで全件」になるのを防ぐためです。
 
 `/leases/count` と `/leases6/count` では `limit` / `offset` / `order_by` / `desc` は件数に影響しません (件数を数えるだけなので)。ただし値の妥当性は一覧系と同じように検査するため、`order_by=bogus` や `limit=0` は400になります。
-また `expire` が `NULL` のリース (Keaスキーマ24以降でありえます) は期限切れ扱いになり、`include_expired=true` を付けたときだけ出てきます。
+また `expire` が `NULL` のリース (Keaスキーマ24以降でありえます) は、無期限の場合を除いて期限切れ扱いになり、`include_expired=true` を付けたときだけ出てきます。
 
 ```sh
 # サブネット1で、まだ生きているリース
@@ -148,7 +149,7 @@ curl 192.0.2.1:3000/leases | jq
 
 先頭7項目とその並びはv0.1と同じです。以降が今回増えた項目です。
 
-- `cltt` … クライアントが最後に通信した時刻。Keaはこの値をDBに持たないので `expire - valid_lifetime` から逆算しています
+- `cltt` … クライアントが最後に通信した時刻。有限リースでは `expire - valid_lifetime` から逆算し、無期限リースでは保存された `expire` をそのまま返します
 - `state` / `state_name` … リースの状態
 - `user_context` … KeaがJSONテキストで持っている値。JSONとして解釈できればオブジェクトのまま返します
 - `relay_id` / `remote_id` … Keaスキーマ16以降
@@ -158,6 +159,7 @@ curl 192.0.2.1:3000/leases | jq
 無い列を `hostname=` や `pool_id=` のような絞り込み・`order_by` に指定した場合は、500ではなく400で「その列がありません」と返します。
 
 `expire` は常にUTCです。KeaはDHCPサーバのローカル時刻で書き込みますが、MySQLの`TIMESTAMP`型は内部的にUTCで保持されるため、DBサーバのタイムゾーン設定にかかわらず正しい時刻が返ります。
+無期限リースの `expire` もDBの保存値を返すため、実際の有効期限ではなく `cltt` を表します。
 
 `/leases/{address}` は指定したアドレスのリースを1件だけ返します。こちらは`state`や有効期限で絞りません。
 
@@ -206,7 +208,8 @@ curl 192.0.2.1:3000/stats | jq
 }
 ```
 
-`total`はテーブルの全行数、`active`は`default`かつ期限内の件数です。
+`total`はテーブルの全行数、`active`は`default`かつ「無期限または期限内」の件数です。
+Kea標準の`assigned-addresses`はstate別の統計で、回収前の期限切れリースを含むことがあるため、この`active`とは一致しない場合があります。
 全リースを引いてから数えるのではなく`GROUP BY`1本で済ませているので、リースが多い環境でも軽いです。
 
 ### メトリクス
@@ -307,6 +310,18 @@ Keaのスキーマは起動時に`information_schema`を見て判定し、その
 `state`名を引くための`lease_state`テーブルが無い場合も、Keaが定義している既知の値 (`default` / `declined` / `expired-reclaimed` / `released` / `registered`) で名前を補います。
 
 動作確認はKeaスキーマ35.0とスキーマ1.0相当 (いずれもMariaDB 11) の両方で行っています。
+
+## テスト
+
+DB不要のテストは `cargo test --locked` で実行できます。
+無期限リースの一覧・件数・集計・メトリクスを検証する回帰テストは、MySQL/MariaDBのテスト用DBへの接続先を指定して実行します。
+
+```sh
+export KEA_LEASE_API_TEST_DATABASE_URL='mysql://user:password@127.0.0.1/kea_test'
+cargo test --locked -- --include-ignored
+```
+
+DB回帰テストは接続内の一時テーブルだけを使用します。接続ユーザには対象DBの `CREATE TEMPORARY TABLES` 権限が必要です。
 
 # このプロジェクトについて
 このプロジェクトはGoogle Gemini 3を使ってコーディングしました。

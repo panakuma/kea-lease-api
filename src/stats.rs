@@ -5,6 +5,7 @@
 
 use crate::capability::{Family, LeaseCapability};
 use crate::error::ApiResult;
+use crate::lease::INFINITY_LFT;
 use crate::state::AppState;
 use axum::{
     Json,
@@ -17,13 +18,16 @@ use sqlx::{MySql, Pool, Row};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+#[cfg(test)]
+mod tests;
+
 /// GROUP BY の 1 行。
 #[derive(Debug, Clone)]
 struct StatRow {
     subnet_id: Option<u32>,
     state: u32,
     total: i64,
-    /// state を問わず、まだ expire を過ぎていない件数。
+    /// state を問わず、無期限またはまだ expire を過ぎていない件数。
     unexpired: i64,
 }
 
@@ -48,7 +52,8 @@ async fn collect(
         "SELECT subnet_id AS subnet_id,
                 {state_expr} AS state,
                 COUNT(*) AS total,
-                COUNT(CASE WHEN expire > NOW() THEN 1 END) AS unexpired
+                COUNT(CASE WHEN valid_lifetime = {INFINITY_LFT} OR expire > NOW()
+                           THEN 1 END) AS unexpired
          FROM {table}
          GROUP BY {group_by}"
     );
@@ -70,7 +75,7 @@ async fn collect(
 pub struct FamilyStats {
     /// 全行数 (失効済みや declined も含む)。
     total: i64,
-    /// state=default かつ expire 前の件数。監視で見たいのは普通これ。
+    /// state=default かつ (無期限または expire 前) の件数。
     active: i64,
     by_state: BTreeMap<String, i64>,
     by_subnet: Vec<SubnetStats>,
@@ -107,7 +112,7 @@ fn summarize(rows: &[StatRow], app: &AppState) -> FamilyStats {
 
     for row in rows {
         let label = state_label(row.state, app);
-        // 「有効」= default (0) かつ expire 前。
+        // 「有効」= default (0) かつ (無期限または expire 前)。
         let row_active = if row.state == 0 { row.unexpired } else { 0 };
 
         total += row.total;
