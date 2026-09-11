@@ -15,6 +15,7 @@ use sqlx::{mysql::MySqlPoolOptions, FromRow, MySql, Pool};
 use std::net::SocketAddr;
 use std::time::Instant;
 
+mod metrics;
 
 #[derive(Clone)]
 struct AppState {
@@ -95,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(list_leases))
         .route("/leases", get(list_leases))
         .route("/leases/count", get(count_leases))
+        .route("/metrics", get(metrics::metrics))
         .with_state(state)
         .layer(axum::middleware::from_fn(log_real_ip));
 
